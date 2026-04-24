@@ -1,0 +1,39 @@
+{
+  "winter": {
+    "festivals": {
+      "new_year": {
+        "startMonth": 12,
+        "startDay": 31,
+        "endMonth": 12,
+        "endDay": 31
+      }
+    }
+  },
+  "spring": {
+    "festivals": {
+      "easter": {
+        "handler": "easter"
+      }
+    }
+  },
+  "summer": {
+    "festivals": {
+      "midsummer": {
+        "startMonth": 6,
+        "startDay": 20,
+        "endMonth": 6,
+        "endDay": 20
+      }
+    }
+  },
+  "autumn": {
+    "festivals": {
+      "halloween": {
+        "startMonth": 10,
+        "startDay": 31,
+        "endMonth": 10,
+        "endDay": 31
+      }
+    }
+  }
+}

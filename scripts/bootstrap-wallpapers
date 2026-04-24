@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root_dir="$(cd "$(dirname "$0")/.." && pwd)"
+raw_wallpaper_dir="$root_dir/wallpapers-raw"
+wallpapers_dir="$root_dir/wallpapers"
+positions_file="$root_dir/config/positions.json"
+defaults_file="$root_dir/config/defaults.json"
+jpeg_quality=75
+
+if ! command -v magick >/dev/null 2>&1; then
+  echo "Error: ImageMagick 'magick' not found in PATH" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: 'jq' not found in PATH" >&2
+  exit 1
+fi
+
+if [[ ! -d "$raw_wallpaper_dir" ]]; then
+  echo "Error: raw wallpaper directory not found: $raw_wallpaper_dir" >&2
+  exit 1
+fi
+
+if [[ ! -f "$positions_file" ]]; then
+  echo "Error: positions file not found: $positions_file" >&2
+  exit 1
+fi
+
+if [[ ! -f "$defaults_file" ]]; then
+  echo "Error: defaults file not found: $defaults_file" >&2
+  exit 1
+fi
+
+tmp_wallpapers_dir="$(mktemp -d "${TMPDIR:-/tmp}/nix-season-wallpapers.wallpapers.tmp.XXXXXX")"
+tmp_widescreen_dir="$tmp_wallpapers_dir/widescreen"
+tmp_normal_dir="$tmp_wallpapers_dir/normal"
+mkdir -p -- "$tmp_widescreen_dir" "$tmp_normal_dir"
+cleanup_ran=0
+
+cleanup() {
+  if (( cleanup_ran == 1 )); then
+    return 0
+  fi
+  cleanup_ran=1
+
+  if [[ -n "${tmp_wallpapers_dir:-}" && -d "${tmp_wallpapers_dir:-}" ]]; then
+    rm -rf -- "$tmp_wallpapers_dir"
+  fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 1' HUP INT TERM
+
+file_size_bytes() {
+  local path="$1"
+  local size=""
+  if size="$(stat -c '%s' -- "$path" 2>/dev/null)"; then
+    printf '%s\n' "$size"
+    return
+  fi
+  if size="$(stat -f '%z' -- "$path" 2>/dev/null)"; then
+    printf '%s\n' "$size"
+    return
+  fi
+  printf '%s\n' "?"
+}
+
+human_size() {
+  local bytes="$1"
+
+  if [[ "$bytes" == "?" || -z "$bytes" ]]; then
+    printf '%s\n' "?"
+    return
+  fi
+
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B --format='%.1f' "$bytes"
+    return
+  fi
+
+  awk -v b="$bytes" '
+    function fmt(x, unit) { return sprintf("%.1f%sB", x, unit) }
+    BEGIN {
+      if (b < 1024) { print b "B"; exit }
+      if (b < 1024^2) { print fmt(b/1024, "Ki"); exit }
+      if (b < 1024^3) { print fmt(b/1024^2, "Mi"); exit }
+      if (b < 1024^4) { print fmt(b/1024^3, "Gi"); exit }
+      print fmt(b/1024^4, "Ti")
+    }
+  '
+}
+
+numbered_position_of() {
+  local wallpapers_dir="$1"
+  local key="$2"
+  local season="${key%_*}"
+  local number_part="${key##*_}"
+
+  if [[ "$number_part" =~ ^[0-9]+$ ]]; then
+    local count
+    count="$(find "$wallpapers_dir" -maxdepth 1 -type f -iregex ".*/${season}_[0-9]+\\.jpg$" | wc -l | tr -d '[:space:]')"
+    jq -r --arg count "$count" --argjson index "$((number_part - 1))" '
+      (.numberedPositions[$count] // [])[ $index ] // "center"
+    ' "$defaults_file"
+    return
+  fi
+
+  printf '%s\n' ""
+}
+
+position_of() {
+  local wallpapers_dir="$1"
+  local key="$2"
+  local lowercase_key
+  lowercase_key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+  local numbered_position
+  numbered_position="$(numbered_position_of "$wallpapers_dir" "$lowercase_key")"
+
+  if [[ -n "$numbered_position" ]]; then
+    printf '%s\n' "$numbered_position"
+    return
+  fi
+
+  jq -r --arg key "$lowercase_key" '.[$key] // "center"' "$positions_file"
+}
+
+preprocess_wallpapers() {
+  local src_wallpapers_dir="$1"
+  local dst_wallpapers_dir="$2"
+
+  while IFS= read -r -d '' src; do
+    local filename stem dst position width height
+    filename="$(basename "$src")"
+    stem="${filename%.*}"
+    dst="$dst_wallpapers_dir/$stem.jpg"
+
+    position="$(position_of "$src_wallpapers_dir" "$stem")"
+
+    read -r width height < <(magick identify -format '%w %h\n' "$src")
+
+    local aspect_difference
+    aspect_difference=$(( width * 9 - height * 16 ))
+    if (( aspect_difference < 0 )); then
+      aspect_difference=$(( -aspect_difference ))
+    fi
+
+    if (( aspect_difference <= 1 )); then
+      magick "$src" \
+        -resize "2560x1440!" \
+        -strip \
+        +profile '*' \
+        -interlace Plane \
+        -sampling-factor 4:2:0 \
+        -quality "$jpeg_quality" \
+      -define jpeg:dct-method=float \
+      "$dst"
+
+      printf 'Normal: %s (raw=%s wide=%s normal=%s)\n' \
+        "$stem" \
+        "$(human_size "${raw_sizes[$stem]-?}")" \
+        "$(human_size "$(file_size_bytes "$src")")" \
+        "$(human_size "$(file_size_bytes "$dst")")"
+      continue
+    fi
+
+    local target_width
+    target_width=$(( height * 16 / 9 ))
+    if (( target_width > width )); then
+      echo "Error: source image too narrow for 16:9 crop: $src (${width}x${height})" >&2
+      exit 1
+    fi
+
+    local offset_x
+    case "$position" in
+      left)
+        offset_x=0
+        ;;
+      center)
+        offset_x=$(( (width - target_width) / 2 ))
+        ;;
+      right)
+        offset_x=$(( width - target_width ))
+        ;;
+      *)
+        echo "Error: invalid position '$position' for $stem" >&2
+        exit 1
+        ;;
+    esac
+
+    magick "$src" \
+      -crop "${target_width}x${height}+${offset_x}+0" +repage \
+      -resize "2560x1440!" \
+      -strip \
+      +profile '*' \
+      -interlace Plane \
+      -sampling-factor 4:2:0 \
+      -quality "$jpeg_quality" \
+      -define jpeg:dct-method=float \
+      "$dst"
+
+    printf 'Normal: %s (raw=%s wide=%s normal=%s)\n' \
+      "$stem" \
+      "$(human_size "${raw_sizes[$stem]-?}")" \
+      "$(human_size "$(file_size_bytes "$src")")" \
+      "$(human_size "$(file_size_bytes "$dst")")"
+  done < <(
+    find "$src_wallpapers_dir" -maxdepth 1 -type f \( \
+      -iname '*.jpg' \
+    \) -print0 | LC_ALL=C sort -z
+  )
+}
+
+declare -A raw_sizes
+
+while IFS= read -r -d '' src; do
+  filename="$(basename "$src")"
+  stem="${filename%.*}"
+  dst="$tmp_widescreen_dir/$stem.jpg"
+
+  raw_sizes["$stem"]="$(file_size_bytes "$src")"
+  printf 'Widescreen: %s (raw=%s)\n' "$stem" "$(human_size "${raw_sizes[$stem]-?}")"
+
+  read -r width height < <(magick identify -format '%w %h\n' "$src")
+
+  aspect_difference=$(( width * 9 - height * 16 ))
+  if (( aspect_difference < 0 )); then
+    aspect_difference=$(( -aspect_difference ))
+  fi
+
+  if (( aspect_difference <= 1 )); then
+    target_size="2560x1440"
+  else
+    target_size="3440x1440"
+  fi
+
+  command_args=(magick "$src")
+
+  command_args+=(
+    -resize "${target_size}^"
+    -gravity center
+    -extent "${target_size}"
+    -background black
+    -alpha remove
+    -alpha off
+    -strip
+    +profile '*'
+    -interlace Plane
+    -sampling-factor 4:2:0
+    -quality "$jpeg_quality"
+    -define jpeg:dct-method=float
+  )
+
+  command_args+=("$dst")
+  "${command_args[@]}"
+
+  printf 'Widescreen: %s (raw=%s wide=%s)\n' \
+    "$stem" \
+    "$(human_size "${raw_sizes[$stem]-?}")" \
+    "$(human_size "$(file_size_bytes "$dst")")"
+done < <(
+  find "$raw_wallpaper_dir" -maxdepth 1 -type f \( \
+    -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
+  \) -print0 | LC_ALL=C sort -z
+)
+
+preprocess_wallpapers "$tmp_widescreen_dir" "$tmp_normal_dir"
+
+rm -rf -- "$wallpapers_dir"
+mkdir -p -- "$(dirname "$wallpapers_dir")"
+mv -- "$tmp_wallpapers_dir" "$wallpapers_dir"
+tmp_wallpapers_dir=""

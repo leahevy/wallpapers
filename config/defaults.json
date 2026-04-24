@@ -1,0 +1,11 @@
+{
+  "festivalPadding": {
+    "before": 3,
+    "after": 3
+  },
+  "numberedPositions": {
+    "1": ["center"],
+    "2": ["left", "right"],
+    "3": ["left", "center", "right"]
+  }
+}
